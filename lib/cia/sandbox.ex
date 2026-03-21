@@ -12,17 +12,24 @@ defmodule CIA.Sandbox do
   @callback start(term(), keyword()) :: {:ok, term()} | {:error, term()}
   @callback stop(term()) :: :ok | {:error, term()}
   @callback exec(term(), [String.t()], keyword()) :: {:ok, term()} | {:error, term()}
+  @callback normalize_config(map()) :: {:ok, map()} | {:error, term()}
+  @optional_callbacks normalize_config: 1
 
   @doc false
   def new(opts) when is_list(opts) do
     with {:ok, id} <- validate_id(Keyword.get(opts, :id)),
          {:ok, provider} <- validate_provider(Keyword.get(opts, :provider)),
-         {:ok, metadata} <- validate_metadata(Keyword.get(opts, :metadata, %{})) do
+         {:ok, metadata} <- validate_metadata(Keyword.get(opts, :metadata, %{})),
+         {:ok, config} <-
+           opts
+           |> Keyword.drop([:id, :provider, :metadata])
+           |> Map.new()
+           |> normalize_config(provider) do
       {:ok,
        %__MODULE__{
          id: id,
          provider: provider,
-         config: opts |> Keyword.drop([:id, :provider, :metadata]) |> Map.new(),
+         config: config,
          metadata: metadata
        }}
     end
@@ -31,6 +38,7 @@ defmodule CIA.Sandbox do
   def module_for(%__MODULE__{provider: provider}), do: module_for(provider)
   def module_for(:local), do: {:ok, CIA.Sandbox.Local}
   def module_for(:sprite), do: {:ok, CIA.Sandbox.Sprite}
+  def module_for(:sprites), do: {:ok, CIA.Sandbox.Sprite}
   def module_for(%module{}), do: {:ok, module}
   def module_for(module) when is_atom(module), do: {:ok, module}
   def module_for(other), do: {:error, {:invalid_sandbox, other}}
@@ -54,6 +62,21 @@ defmodule CIA.Sandbox do
   def stop(sandbox) do
     with {:ok, module} <- module_for(sandbox) do
       module.stop(sandbox)
+    end
+  end
+
+  defp normalize_config(config, provider) when is_map(config) do
+    with {:ok, module} <- module_for(provider) do
+      case Code.ensure_loaded(module) do
+        {:module, _module} ->
+          case function_exported?(module, :normalize_config, 1) do
+            true -> module.normalize_config(config)
+            false -> {:ok, config}
+          end
+
+        {:error, _reason} ->
+          {:ok, config}
+      end
     end
   end
 

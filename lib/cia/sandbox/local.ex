@@ -6,7 +6,15 @@ defmodule CIA.Sandbox.Local do
   alias CIA.Sandbox.Channel
   alias CIA.Sandbox.Local.Channel.Stdio
 
-  defstruct [:mode, :channel, metadata: %{}]
+  @supported_lifecycles [:ephemeral]
+
+  defstruct [:mode, :channel, :lifecycle, metadata: %{}]
+
+  def normalize_config(config) when is_map(config) do
+    with {:ok, lifecycle} <- normalize_lifecycle(Map.get(config, :lifecycle, :ephemeral)) do
+      {:ok, Map.put(config, :lifecycle, lifecycle)}
+    end
+  end
 
   def start(%CIA.Sandbox{provider: :local, config: config, metadata: metadata}, opts)
       when is_list(opts) do
@@ -16,11 +24,15 @@ defmodule CIA.Sandbox.Local do
       |> Keyword.merge(opts)
       |> Keyword.put_new(:metadata, metadata)
 
-    mode = sandbox_mode(opts)
-    metadata = Keyword.get(opts, :metadata, %{})
-
-    with {:ok, channel} <- start_channel(opts) do
-      {:ok, %__MODULE__{mode: mode, channel: channel, metadata: metadata}}
+    with {:ok, lifecycle} <- normalize_lifecycle(sandbox_lifecycle(opts)),
+         {:ok, channel} <- start_channel(opts) do
+      {:ok,
+       %__MODULE__{
+         mode: sandbox_mode(opts),
+         channel: channel,
+         lifecycle: lifecycle,
+         metadata: Keyword.get(opts, :metadata, %{})
+       }}
     end
   end
 
@@ -48,6 +60,7 @@ defmodule CIA.Sandbox.Local do
   end
 
   defp sandbox_mode(opts), do: Keyword.get(opts, :mode, :workspace_write)
+  defp sandbox_lifecycle(opts), do: Keyword.get(opts, :lifecycle, :ephemeral)
 
   defp start_channel(opts) do
     command =
@@ -101,4 +114,15 @@ defmodule CIA.Sandbox.Local do
        do: [command | args]
 
   defp normalize_runtime_command(command) when is_list(command), do: command
+
+  defp normalize_lifecycle(lifecycle) when lifecycle in @supported_lifecycles,
+    do: {:ok, lifecycle}
+
+  defp normalize_lifecycle(lifecycle) when lifecycle in [:durable, :attached] do
+    {:error, {:unsupported_sandbox_lifecycle, :local, lifecycle}}
+  end
+
+  defp normalize_lifecycle(lifecycle) do
+    {:error, {:invalid_option, {:lifecycle, lifecycle}}}
+  end
 end

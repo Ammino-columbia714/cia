@@ -25,8 +25,19 @@ defmodule CIA.SandboxTest do
 
     assert sandbox.id == "sandbox_1"
     assert sandbox.provider == :local
-    assert sandbox.config == %{mode: :workspace_write}
+    assert sandbox.config == %{lifecycle: :ephemeral, mode: :workspace_write}
     assert sandbox.metadata == %{source: "test"}
+  end
+
+  test "new defaults Sprite lifecycle to ephemeral" do
+    assert {:ok, sandbox} =
+             Sandbox.new(
+               id: "sandbox_1",
+               provider: :sprite,
+               token: "sprite-token"
+             )
+
+    assert sandbox.config == %{lifecycle: :ephemeral, token: "sprite-token"}
   end
 
   test "new requires a provider" do
@@ -48,6 +59,41 @@ defmodule CIA.SandboxTest do
     assert Sandbox.module_for("local") == {:error, {:invalid_sandbox, "local"}}
   end
 
+  test "new rejects unsupported local sandbox lifecycles" do
+    assert Sandbox.new(id: "sandbox_1", provider: :local, lifecycle: :durable) ==
+             {:error, {:unsupported_sandbox_lifecycle, :local, :durable}}
+  end
+
+  test "new rejects invalid lifecycle values" do
+    assert Sandbox.new(
+             id: "sandbox_1",
+             provider: :sprite,
+             lifecycle: :bogus,
+             token: "sprite-token"
+           ) ==
+             {:error, {:invalid_option, {:lifecycle, :bogus}}}
+  end
+
+  test "new requires a name for durable Sprite sandboxes" do
+    assert Sandbox.new(
+             id: "sandbox_1",
+             provider: :sprite,
+             lifecycle: :durable,
+             token: "sprite-token"
+           ) ==
+             {:error, {:missing_option, :name}}
+  end
+
+  test "new requires a name for attached Sprite sandboxes" do
+    assert Sandbox.new(
+             id: "sandbox_1",
+             provider: :sprite,
+             lifecycle: :attached,
+             token: "sprite-token"
+           ) ==
+             {:error, {:missing_option, :name}}
+  end
+
   test "start delegates to the sandbox module" do
     sandbox = %Sandbox{id: "sandbox_1", provider: FakeSandbox}
 
@@ -60,6 +106,15 @@ defmodule CIA.SandboxTest do
 
     assert Sandbox.start(sandbox, command: ["cia-command-that-does-not-exist"]) ==
              {:error, {:command_not_found, "cia-command-that-does-not-exist"}}
+  end
+
+  test "local start carries the normalized lifecycle into the runtime" do
+    {:ok, sandbox} = Sandbox.new(id: "sandbox_2", provider: :local)
+
+    assert {:ok, runtime} = Sandbox.start(sandbox, command: ["/bin/sh", "-lc", "sleep 1"])
+    assert runtime.lifecycle == :ephemeral
+
+    assert :ok = Sandbox.stop(runtime)
   end
 
   test "exec delegates to the sandbox module when supported" do

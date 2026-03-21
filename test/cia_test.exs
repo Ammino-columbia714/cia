@@ -24,13 +24,17 @@ defmodule CIATest do
   end
 
   test "sandbox stores the positional provider and preserves the generated id" do
-    plan = CIA.new() |> CIA.sandbox(:local, metadata: %{source: "test"})
+    plan =
+      CIA.new()
+      |> CIA.sandbox(:local, metadata: %{source: "test"}, lifecycle: :ephemeral)
+
     sandbox_id = plan.sandbox.id
 
     updated_plan = CIA.sandbox(plan, :local, mode: :workspace_write)
 
     assert updated_plan.sandbox.id == sandbox_id
     assert updated_plan.sandbox.provider == :local
+    assert updated_plan.sandbox.lifecycle == :ephemeral
     assert updated_plan.sandbox.metadata == %{source: "test"}
     assert updated_plan.sandbox.mode == :workspace_write
   end
@@ -76,6 +80,15 @@ defmodule CIATest do
       |> CIA.harness(:codex, cwd: "/sandbox")
 
     assert CIA.start(plan) == {:error, {:invalid_option, {:harness, :cwd}}}
+  end
+
+  test "start rejects unsupported sandbox lifecycle combinations" do
+    plan =
+      CIA.new()
+      |> CIA.sandbox(:local, lifecycle: :durable)
+      |> CIA.workspace(:directory, root: "/sandbox")
+
+    assert CIA.start(plan) == {:error, {:unsupported_sandbox_lifecycle, :local, :durable}}
   end
 
   test "starts an agent against the fake stdio app-server", %{trace_file: trace_file} do

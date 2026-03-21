@@ -8,6 +8,12 @@ Mix.install([{:cia, github: "seanmor5/cia"}])
 
 [Sprites](https://sprites.dev) is a remote sandbox option for CIA.
 
+Sprite sandbox declarations support three lifecycle modes:
+
+- `:ephemeral` creates dedicated compute for the agent and destroys it on stop
+- `:durable` creates the named sprite if needed and keeps it on stop
+- `:attached` expects the named sprite to already exist and keeps it on stop
+
 ## Environment
 
 The examples below assume these environment variables are available:
@@ -23,7 +29,7 @@ openai_api_key = System.fetch_env!("LB_OPENAI_API_KEY")
 ## Minimal Remote Agent
 
 ```elixir
-sandbox_opts = [name: sprite_name, token: sprite_token]
+sandbox_opts = [name: sprite_name, token: sprite_token, lifecycle: :durable]
 
 config =
   CIA.new()

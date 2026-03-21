@@ -22,6 +22,14 @@ Each agent runs as a GenServer. CIA can start agents directly or under your own
 supervisor. Right now, CIA is entirely in-memory. Agent, thread, and turn state
 does not survive application restarts.
 
+Sandbox declarations can also carry lifecycle semantics. CIA currently supports:
+
+- `lifecycle: :ephemeral` - create or acquire compute for this agent and release it on stop
+- `lifecycle: :durable` - ensure named compute exists and keep it on stop
+- `lifecycle: :attached` - attach to named compute that must already exist and keep it on stop
+
+`:local` sandboxes only support `:ephemeral`. `:sprite` supports all three.
+
 ## Installation
 
 Install from GitHub for now:
@@ -72,6 +80,20 @@ config =
 
 `CIA.start/1` consumes the built configuration. Sandbox, workspace, and harness
 configuration all flow through it.
+
+For remote sandboxes, lifecycle is configured on the sandbox declaration:
+
+```elixir
+config =
+  CIA.new()
+  |> CIA.sandbox(:sprite,
+    token: System.fetch_env!("CIA_SPRITE_TOKEN"),
+    lifecycle: :durable,
+    name: "team-sandbox"
+  )
+  |> CIA.workspace(:directory, root: "/workspace")
+  |> CIA.harness(:codex, auth: {:api_key, openai_api_key})
+```
 
 `CIA.before_start/2` is the hook for deterministic startup configuration.
 It runs after the sandbox starts but before the harness session is started,
