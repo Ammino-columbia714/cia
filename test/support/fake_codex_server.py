@@ -48,8 +48,10 @@ class FakeCodexServer:
                 continue
 
             self.trace("received", message)
-            if "id" in message:
+            if "id" in message and "method" in message:
                 self.handle_request(message)
+            elif "id" in message:
+                self.handle_response(message)
             else:
                 self.handle_notification(message)
 
@@ -75,6 +77,9 @@ class FakeCodexServer:
         self.trace("notification", message)
         self.maybe_emit_events(method)
         self.maybe_exit(method)
+
+    def handle_response(self, message):
+        self.trace("response", message)
 
     def result_for(self, method, params):
         if method == "initialize":
@@ -130,6 +135,8 @@ class FakeCodexServer:
                 continue
 
             message = {"jsonrpc": "2.0", "method": event["method"]}
+            if "id" in event:
+                message["id"] = event["id"]
             if "params" in event:
                 message["params"] = event["params"]
             self.send(message)

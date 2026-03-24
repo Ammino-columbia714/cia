@@ -17,6 +17,7 @@ defmodule CIA.Agent.State do
     :auth,
     hooks: %{},
     env: %{},
+    state: %{},
     threads: %{},
     turns: %{}
   ]
@@ -27,6 +28,7 @@ defmodule CIA.Agent.State do
          %Workspace{} = workspace <- Keyword.get(opts, :workspace),
          {:ok, hooks} <- validate_hooks(Keyword.get(opts, :hooks, %{})),
          {:ok, env} <- validate_env(Keyword.get(opts, :env, %{})),
+         {:ok, hook_state} <- validate_state(Keyword.get(opts, :state, %{})),
          {:ok, %Agent{} = agent} <-
            Agent.new(
              id: harness.id,
@@ -45,7 +47,8 @@ defmodule CIA.Agent.State do
          workspace: workspace,
          hooks: hooks,
          auth: harness.config[:auth] || harness.config["auth"],
-         env: env
+         env: env,
+         state: hook_state
        }}
     else
       _ ->
@@ -103,8 +106,15 @@ defmodule CIA.Agent.State do
     %__MODULE__{state | workspace: workspace}
   end
 
+  def put_hook_state(%__MODULE__{} = state, hook_state) when is_map(hook_state) do
+    %__MODULE__{state | state: hook_state}
+  end
+
   defp validate_env(env) when is_map(env), do: {:ok, env}
   defp validate_env(_), do: {:error, {:invalid_env, :expected_map}}
+
+  defp validate_state(state) when is_map(state), do: {:ok, state}
+  defp validate_state(_), do: {:error, {:invalid_state, :expected_map}}
 
   defp validate_hooks(nil), do: {:ok, %{}}
 

@@ -18,6 +18,10 @@ defmodule CIA.Harness.Codex.Connection do
     GenServer.call(pid, {:notify, method, params}, timeout)
   end
 
+  def respond(pid, request_id, result, timeout \\ 5_000) when is_pid(pid) do
+    GenServer.call(pid, {:respond, request_id, result}, timeout)
+  end
+
   def stop(pid, timeout \\ 5_000) when is_pid(pid) do
     GenServer.stop(pid, :normal, timeout)
   end
@@ -66,6 +70,19 @@ defmodule CIA.Harness.Codex.Connection do
         "method" => method
       }
       |> maybe_put_params(params)
+
+    case send_message(state.channel, message) do
+      :ok -> {:reply, :ok, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:respond, request_id, result}, _from, state) do
+    message = %{
+      "jsonrpc" => "2.0",
+      "id" => request_id,
+      "result" => result
+    }
 
     case send_message(state.channel, message) do
       :ok -> {:reply, :ok, state}
@@ -152,6 +169,22 @@ defmodule CIA.Harness.Codex.Connection do
 
       {:ok, %{"id" => id, "error" => error}} when is_integer(id) ->
         reply_and_drop_pending(state, id, {:error, normalize_error(error)})
+
+      {:ok, %{"id" => id, "method" => method, "params" => params} = message} ->
+        notify_owner(
+          state.owner,
+          {:server_request, %{id: id, method: method, params: params, message: message}}
+        )
+
+        state
+
+      {:ok, %{"id" => id, "method" => method} = message} ->
+        notify_owner(
+          state.owner,
+          {:server_request, %{id: id, method: method, params: nil, message: message}}
+        )
+
+        state
 
       {:ok, %{"method" => method, "params" => params} = message} ->
         notify_owner(

@@ -25,6 +25,7 @@ defmodule CIA.Agent.StateTest do
     assert state.auth == {:api_key, "test-key"}
     assert state.hooks == %{before_start: [before_start]}
     assert state.env == %{"CIA_ENV" => "test"}
+    assert state.state == %{}
     assert state.threads == %{}
     assert state.turns == %{}
   end
@@ -44,6 +45,15 @@ defmodule CIA.Agent.StateTest do
              sandbox: sandbox(),
              workspace: workspace(),
              hooks: %{before_start: [:bad]}
+           ) == {:error, :invalid_state}
+  end
+
+  test "new returns invalid_state when state is not a map" do
+    assert State.new(
+             harness: harness(),
+             sandbox: sandbox(),
+             workspace: workspace(),
+             state: [:bad]
            ) == {:error, :invalid_state}
   end
 

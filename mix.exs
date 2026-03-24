@@ -1,16 +1,19 @@
 defmodule CIA.MixProject do
   use Mix.Project
 
+  @version "0.0.1"
+
   def project do
     [
       app: :cia,
-      version: "0.1.0",
+      version: @version,
       description: description(),
       elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       source_url: "https://github.com/seanmor5/cia",
       homepage_url: "https://github.com/seanmor5/cia",
+      package: package(),
       docs: docs(),
       deps: deps()
     ]
@@ -36,12 +39,13 @@ defmodule CIA.MixProject do
   defp docs do
     [
       main: "CIA",
-      extras: ["README.md"] ++ guide_extras(),
+      extras: ["README.md", "CHANGELOG.md"] ++ guide_extras(),
       groups_for_extras: [
         Overview: ["README.md"],
+        Reference: ["CHANGELOG.md"],
         Guides: guide_extras()
       ],
-      source_ref: "main",
+      source_ref: "v#{@version}",
       source_url: "https://github.com/seanmor5/cia"
     ]
   end
@@ -55,5 +59,15 @@ defmodule CIA.MixProject do
 
   defp description do
     "Manage background agents directly in your Elixir app."
+  end
+
+  defp package do
+    [
+      licenses: ["Apache-2.0"],
+      files: ["lib", "guides", "mix.exs", "README.md", "CHANGELOG.md", "LICENSE"],
+      links: %{
+        "GitHub" => "https://github.com/seanmor5/cia"
+      }
+    ]
   end
 end

@@ -27,13 +27,14 @@ defmodule CIA.Sandbox.SpriteLiveTest do
 
   test "interactive exec streams stdout over the Sprite channel", config do
     sandbox = start_sprite!(config, ["cat"])
+    runtime = sandbox.runtime
     marker = "sprite-roundtrip-#{System.unique_integer([:positive])}\n"
 
     assert_receive {:cia_sandbox_channel, channel_pid, {:message, %{"type" => "session_info"}}},
                    15_000
 
-    assert channel_pid == sandbox.channel.pid
-    assert :ok = Channel.send(sandbox.channel, marker)
+    assert channel_pid == runtime.channel.pid
+    assert :ok = Channel.send(runtime.channel, marker)
     assert_receive_data(channel_pid, marker, "")
   end
 

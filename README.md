@@ -6,7 +6,7 @@ Manage background agents directly in your Elixir app.
 
 CIA is an opinionated library for running background agents from an Elixir app.
 
-It separates two runtime concerns:
+It separates three runtime concerns:
 
 - the sandbox: where that agent is running
 - the workspace: what filesystem scope that work should happen in
@@ -22,41 +22,16 @@ Each agent runs as a GenServer. CIA can start agents directly or under your own
 supervisor. Right now, CIA is entirely in-memory. Agent, thread, and turn state
 does not survive application restarts.
 
-Sandbox declarations can also carry lifecycle semantics. CIA currently supports:
-
-- `lifecycle: :ephemeral` - create or acquire compute for this agent and release it on stop
-- `lifecycle: :durable` - ensure named compute exists and keep it on stop
-- `lifecycle: :attached` - attach to named compute that must already exist and keep it on stop
-
-`:local` sandboxes only support `:ephemeral`. `:sprite` supports all three.
-
 ## Installation
 
-Install from GitHub for now:
+Install from Hex:
 
 ```elixir
 def deps do
   [
-    {:cia, github: "seanmor5/cia"}
+    {:cia, "~> 0.0.1"}
   ]
 end
-```
-
-## Documentation
-
-Generate docs locally with:
-
-```sh
-mix docs
-```
-
-Livebook guides live in `guides/` and are published as part of the generated
-docs.
-
-Run the docs pipeline with warnings treated as errors:
-
-```sh
-mix docs --warnings-as-errors
 ```
 
 ## Usage
@@ -78,38 +53,11 @@ config =
 {:ok, agent} = CIA.start(config)
 ```
 
-`CIA.start/1` consumes the built configuration. Sandbox, workspace, and harness
-configuration all flow through it.
-
-For remote sandboxes, lifecycle is configured on the sandbox declaration:
-
-```elixir
-config =
-  CIA.new()
-  |> CIA.sandbox(:sprite,
-    token: System.fetch_env!("CIA_SPRITE_TOKEN"),
-    lifecycle: :durable,
-    name: "team-sandbox"
-  )
-  |> CIA.workspace(:directory, root: "/workspace")
-  |> CIA.harness(:codex, auth: {:api_key, openai_api_key})
-```
-
-`CIA.before_start/2` is the hook for deterministic startup configuration.
-It runs after the sandbox starts but before the harness session is started,
-so it is the right place to create directories, write seed files, or sync code
-before Codex begins handling turns.
-
 To start an agent under your own supervisor instead:
 
 ```elixir
 {:ok, agent} = CIA.start(config, supervisor: MyApp.CIAAgentSupervisor)
 ```
-
-Today, the supported workspace kind is `:directory`.
-The `before_start` hook runs after sandbox start and before workspace and harness
-startup. If it returns anything other than `:ok`, startup is rolled back and
-`CIA.start/1` returns an error.
 
 After startup, create a thread and submit a turn:
 
@@ -126,19 +74,9 @@ After startup, create a thread and submit a turn:
   CIA.turn(agent, thread, "Create lib/demo.ex with a function that returns :ok.")
 ```
 
-For local Codex runs, if the `codex` binary is not on the BEAM process `PATH`,
-pass an absolute command path:
-
-```elixir
-|> CIA.harness(:codex,
-  command: {"/opt/homebrew/bin/codex", ["app-server", "--listen", "stdio://"]},
-  auth: {:api_key, openai_api_key}
-)
-```
-
 ## Events
 
-CIA supports agent-level subscriptions through `subscribe/2`.
+CIA supports agent-level subscriptions through `subscribe/2` and `subscribe/3`.
 
 Subscribers currently receive messages in this form:
 
@@ -146,19 +84,52 @@ Subscribers currently receive messages in this form:
 {:cia, %CIA.Agent{}, event}
 ```
 
-The current event stream forwards harness-originated events from the running
-agent process, for example:
+CIA emits normalized events for requests, threads, turns, and sandbox watch
+activity:
+
+```elixir
+{:cia, agent, {:request, :approval, payload}}
+{:cia, agent, {:request, :user_input, payload}}
+{:cia, agent, {:request, :resolved, payload}}
+{:cia, agent, {:thread, :started, payload}}
+{:cia, agent, {:turn, :status, payload}}
+{:cia, agent, {:sandbox, :watch, watch_id, payload}}
+```
+
+Raw harness payloads are still forwarded for compatibility:
 
 ```elixir
 {:cia, agent, {:harness, :codex, payload}}
 ```
 
-Subscriptions are for all agent events.
+To filter delivery to specific event families:
+
+```elixir
+CIA.subscribe(agent, self(), events: [:request, :turn])
+```
+
+Pending normalized requests can be answered through `CIA.resolve/3`:
+
+```elixir
+CIA.resolve(agent, request_id, :approve)
+CIA.resolve(agent, request_id, :approve_for_session)
+CIA.resolve(agent, request_id, :deny)
+CIA.resolve(agent, request_id, :cancel)
+CIA.resolve(agent, request_id, {:input, "Use the online migration path."})
+```
 
 ## Supported Harnesses
 
-CIA currently just supports codex via it's app-server implementation.
+CIA currently supports Codex through its app-server implementation.
 
 ## Supported Sandboxes
 
 CIA currently supports `:local` and `:sprite` (see [Sprite](https://sprite.dev)) based sandboxes.
+
+## License
+
+Copyright (c) 2026 Sean Moriarity
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.

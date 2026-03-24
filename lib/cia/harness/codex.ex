@@ -6,6 +6,7 @@ defmodule CIA.Harness.Codex do
   alias CIA.Agent.State
   alias CIA.Harness
   alias CIA.Harness.Codex.Connection
+  alias CIA.Sandbox
 
   def runtime_command(%State{harness: harness}) do
     harness
@@ -35,13 +36,13 @@ defmodule CIA.Harness.Codex do
   end
 
   def start_thread(%Harness{} = harness, opts) when is_list(opts) do
-    params =
-      %{}
-      |> put_if_present("cwd", Keyword.get(opts, :cwd, harness.cwd))
-      |> put_if_present("model", Keyword.get(opts, :model))
-      |> put_if_present("baseInstructions", Keyword.get(opts, :system_prompt))
-
-    with {:ok, %{"thread" => %{"id" => thread_id}} = response} <-
+    with {:ok, base_instructions} <- build_base_instructions(harness, opts),
+         params <-
+           %{}
+           |> put_if_present("cwd", Keyword.get(opts, :cwd, harness.cwd))
+           |> put_if_present("model", Keyword.get(opts, :model))
+           |> put_if_present("baseInstructions", base_instructions),
+         {:ok, %{"thread" => %{"id" => thread_id}} = response} <-
            Connection.request(session_pid(harness), "thread/start", params, request_timeout(opts)) do
       {:ok, %{id: thread_id, response: response}}
     end
@@ -105,8 +106,14 @@ defmodule CIA.Harness.Codex do
     end
   end
 
+  def resolve(%Harness{} = harness, request_id, decision) do
+    with {:ok, result} <- normalize_resolution(decision) do
+      Connection.respond(session_pid(harness), request_id, result)
+    end
+  end
+
   defp connection_opts(%State{sandbox: sandbox}) do
-    case sandbox do
+    case Sandbox.runtime(sandbox) do
       %{channel: channel} when not is_nil(channel) ->
         [owner: self(), channel: channel]
 
@@ -193,6 +200,13 @@ defmodule CIA.Harness.Codex do
     end
   end
 
+  defp normalize_resolution(:approve), do: {:ok, "accept"}
+  defp normalize_resolution(:approve_for_session), do: {:ok, "acceptForSession"}
+  defp normalize_resolution(:deny), do: {:ok, "decline"}
+  defp normalize_resolution(:cancel), do: {:ok, "cancel"}
+  defp normalize_resolution({:input, value}), do: {:ok, value}
+  defp normalize_resolution(other), do: {:error, {:invalid_resolution, other}}
+
   defp normalize_input(input) when is_binary(input) do
     [%{"type" => "text", "text" => input}]
   end
@@ -227,6 +241,45 @@ defmodule CIA.Harness.Codex do
 
   defp harness_config(%CIA.Harness{config: config}) when is_map(config), do: Map.to_list(config)
   defp harness_config(_), do: []
+
+  defp build_base_instructions(%Harness{} = harness, opts) do
+    with {:ok, harness_segments} <- render_harness_instructions(Harness.instructions(harness)) do
+      segments =
+        harness_segments
+        |> maybe_append_segment(Keyword.get(opts, :system_prompt))
+
+      case segments do
+        [] -> {:ok, nil}
+        _ -> {:ok, Enum.join(segments, "\n\n")}
+      end
+    end
+  end
+
+  defp render_harness_instructions(instructions) when is_list(instructions) do
+    Enum.reduce_while(instructions, {:ok, []}, fn
+      {:text, text}, {:ok, acc} when is_binary(text) and text != "" ->
+        {:cont, {:ok, acc ++ [text]}}
+
+      {:file, path}, {:ok, acc} when is_binary(path) and path != "" ->
+        case File.read(path) do
+          {:ok, content} -> {:cont, {:ok, acc ++ [content]}}
+          {:error, reason} -> {:halt, {:error, {:instruction_file_error, path, reason}}}
+        end
+
+      :project_files, {:ok, acc} ->
+        {:cont, {:ok, acc}}
+
+      {:project_files, _enabled}, {:ok, acc} ->
+        {:cont, {:ok, acc}}
+
+      other, _acc ->
+        {:halt, {:error, {:invalid_instruction, other}}}
+    end)
+  end
+
+  defp maybe_append_segment(segments, nil), do: segments
+  defp maybe_append_segment(segments, ""), do: segments
+  defp maybe_append_segment(segments, segment) when is_binary(segment), do: segments ++ [segment]
 
   defp session_pid(%Harness{session: %{pid: pid}}) when is_pid(pid), do: pid
 

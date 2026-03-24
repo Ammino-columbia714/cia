@@ -1,91 +1,196 @@
 defmodule CIA do
   @moduledoc """
   The CIA (Central Intelligence Agent) is an opinionated library for managing
-  background agents from Elixir apps.
+  background agents from an Elixir app.
 
-  ## Overview
+  CIA takes the position that a background agent always consists of:
 
-  CIA manages 3 abstractions internally:
+    * the sandbox: where that agent is running
+    * the workspace: what filesystem scope that work should happen in
+    * the harness: what agent implementation is running
 
-    1. The sandbox, e.g. where code can run
-    2. The workspace, e.g. what filesystem scope work should happen in
-    3. The harness, e.g. what agent you're running
+  And can be interacted with by managing threads and turns.
 
-  And is concerned with 3 core models:
+  ## Getting Started
 
-    1. Agents - A single instance of a running background agent
-    2. Threads - A chain of requests belonging to a single agent
-    3. Turns - A single request/response within a single thread
+  To create an agent, you must configure a sandbox, a workspace, and a harness:
 
-  Each background agent runs as a GenServer. CIA can start agents directly or
-  under a caller-provided supervisor. Agent state is all persisted in-memory
-  and does not survive across application restarts.
-
-  ## Creating Agents
-
-  CIA agents are configured through a pipeable builder:
+      key = System.fetch_env!("OPENAI_API_KEY")
 
       config =
         CIA.new()
         |> CIA.sandbox(:local)
-        |> CIA.workspace(:directory, root: "/workspace")
+        |> CIA.workspace(:directory, root: "/tmp/cia-demo")
+        |> CIA.harness(:codex, auth: {:api_key, key})
+
+  Configurations are data-only until the agent is actually started:
+
+      {:ok, agent} = CIA.start(plan)
+
+  After an agent has been started, you can create threads and submit turns:
+
+      {:ok, thread} = CIA.thread(agent, cwd: "/tmp/cia-demo")
+      {:ok, _turn} = CIA.turn(agent, thread, "Create a README that explains the project.")
+
+  ## Managing Sandbox and Workspace Lifecycles
+
+  CIA treats sandbox and workspace management as explicit concerns instead of
+  implicitly tying them to the agent.
+
+  In practice, CIA supports 3 lifecycle modes for both sandboxes and workspaces:
+
+    * `:ephemeral` - sandbox or workspace is created and destroyed with the agent
+    * `:durable` - sandbox or workspace is created, but persists after the agent dies
+    * `:attached` - sandboxes or workspace is assumed to exist before the agent starts
+      and after the agent dies
+
+  ## Using Lifecycle Hooks
+
+  It is common to want to perform some setup work before starting an agent. CIA
+  exposes lifecycle hooks which you can use to perform setup work, start filesystem
+  watches, or checkpoint sandbox state after some work has been done:
+
+      plan =
+        CIA.new()
+        |> CIA.sandbox(:local, lifecycle: :ephemeral)
+        |> CIA.workspace(:directory, root: "/tmp/cia-demo")
         |> CIA.before_start(fn %{sandbox: sandbox} ->
-          {_, 0} = CIA.Sandbox.cmd(sandbox, "mkdir", ["-p", "/workspace/lib"]),
-          {_, 0} = CIA.Sandbox.cmd(sandbox, "git", ["clone", "repo"])
-          :ok
+          with {_, 0} <- CIA.Sandbox.cmd(sandbox, "mkdir", ["-p", "/tmp/cia-demo"]) do
+            :ok
+          end
         end)
-        |> CIA.harness(:codex, auth: {:api_key, System.fetch_env!("OPENAI_API_KEY")})
 
-      {:ok, agent} = CIA.start(config)
+  Supported hooks are `before_start`, `after_start`, `before_stop`, `after_stop`.
+  These hooks are relative to the *harness process*, meaning they always run after
+  the sandbox and workspace have been initialized.
 
-  CIA also supports agent-scoped lifecycle hooks like `before_start/2` and
-  `after_stop/2`. These hooks are named relative to the agent operation, not
-  the sandbox. `before_start/2` runs after the sandbox exists but before the
-  agent harness session starts, which makes it the right place to create
-  directories, sync files, write seed config, and verify prerequisites before
-  Codex begins handling requests.
+  Hooks forward user-managed state if returned from within the hook:
 
-  Authentication is configured on the harness builder step and is treated as a
-  harness-level concern. CIA currently supports:
+      plan =
+        CIA.new()
+        |> CIA.sandbox(:local)
+        |> CIA.workspace(:directory)
+        |> CIA.before_start(fn %{sandbox: sandbox, state: state} ->
+          tmpdir = "/tmp/dir_#{System.unique_integer([:positive, :monotonic])}"
 
-  - `auth: {:api_key, key}`
+          with {_, 0} <- CIA.Sandbox.cmd(sandbox, "mkdir", ["-p", tmpdir]) do
+            {:ok, Map.put(state, :tmpdir, tmpdir)}
+          end
+        end)
+        |> CIA.before_stop(fn %{state: %{tmpdir: tmpdir}} ->
+          with {_, 0} <- CIA.Sandbox.cmd(sandbox, "rm", ["-rf", tmpdir]) do
+            :ok
+          end
+        end)
 
-  CIA stores that auth privately and passes it to the active harness during
-  session startup. It is not exposed on public handles and is not configured per
-  thread or per turn.
+  ## Streaming Agent Events
 
-  ## Running Background Agents
+  CIA allows you to subscribe to event streams emitted by running agents.
+  These event streams consist of normalized events for thread lifecycle, turn
+  lifecycle, sandbox watch activity, and interactive harness requests. Raw
+  harness events are also available for adapter-specific integrations.
 
-  `start/1` starts an agent server process and returns a `%CIA.Agent{}` struct.
-  All public operations require this handle.
+  Events have the following shape:
 
-  After starting an agent, you can create and interact with threads:
+      {:cia, agent, event}
 
-      {:ok, thread} = CIA.thread(agent,
-        cwd: "/workspace",
-        model: "gpt-5.4"
-      )
+  You can subscribe to all or a filtered subset of agent events:
 
-      {:ok, turn} = CIA.turn(agent, thread, "Implement a Linked List in C")
-      CIA.steer(agent, turn, "And please add tests")
-      CIA.cancel(agent, turn)
+      :ok = CIA.subscribe(agent, self(), events: [:thread, :turn, :request, :raw])
 
-  Once you are done with an agent, you can stop it with `CIA.stop(agent)`.
+      receive do
+        {:cia, ^agent, {:turn, :started, %{turn_id: turn_id}}} ->
+          IO.puts("turn started: \#{turn_id}")
 
-  ## Events
+        {:cia, ^agent, {:request, :approval, request}} ->
+          IO.inspect(request, label: "approval needed")
 
-  CIA supports agent-level subscriptions through `subscribe/2`.
+        {:cia, ^agent, {:harness, :codex, payload}} ->
+          IO.inspect(payload, label: "raw codex event")
+      end
 
-  Subscribers currently receive messages in this form:
+  If you subscribe to events within an agent lifecycle hook, they are owned and forwarded
+  through the managing agent process by default. For example, if you start a sandbox
+  filesystem watch inside `before_start`, you will receive those messages through an
+  agent subscription:
 
-      {:cia, %CIA.Agent{}, event}
+      plan =
+        CIA.new()
+        |> CIA.sandbox(:local)
+        |> CIA.workspace(:directory, root: "/tmp/cia-demo")
+        |> CIA.before_start(fn %{sandbox: sandbox} ->
+          case CIA.Sandbox.watch(sandbox, ["/tmp/cia-demo"], recursive: true) do
+            {:ok, _watch} -> :ok
+            {:error, reason} -> {:error, reason}
+          end
+        end)
+        |> CIA.harness(:codex, auth: {:api_key, key})
 
-  In the current implementation, `event` is a forwarded harness event:
+      {:ok, agent} = CIA.start(plan)
+      :ok = CIA.subscribe(agent, self(), events: [:sandbox])
 
-      {:harness, harness_name, payload}
+  Once that watch exists, CIA forwards sandbox watch activity as normalized
+  agent events:
 
-  This is intentionally narrow for now. CIA does not yet normalize all harness
-  notifications into higher-level thread and turn lifecycle events.
+      receive do
+        {:cia, ^agent, {:sandbox, :watch, watch_id, :ready}} ->
+          IO.puts("sandbox watch ready: \#{watch_id}")
+
+        {:cia, ^agent, {:sandbox, :watch, watch_id, {:event, %{type: :write, path: path}}}} ->
+          IO.puts("sandbox watch \#{watch_id}: wrote \#{path}")
+      end
+
+  ## Resolving Input Requests
+
+  Some harness actions are interactive. For example, a harness may ask for
+  approval before running a command or ask for additional user input while a
+  turn is in progress.
+
+  CIA normalizes those requests into events and lets the application answer
+  them with `resolve/3`.
+
+      receive do
+        {:cia, ^agent, {:request, :approval, %{id: request_id}}} ->
+          :ok = CIA.resolve(agent, request_id, :approve_for_session)
+
+        {:cia, ^agent, {:request, :user_input, %{id: request_id}}} ->
+          :ok = CIA.resolve(agent, request_id, {:input, "Continue with the migration."})
+      end
+
+  The caller can log, audit, defer, or deny requests without needing direct access
+  to harness-specific transport details.
+
+  ## Customizing a Harness
+
+  Basic harness configuration happens via `CIA.harness/3`. CIA also supports more
+  involved customizations:
+
+    * `CIA.mcp/3` - configure/attach MCPs to the agent harness
+    * `CIA.tool/2` - configure tool-policies for the agent harness
+
+  For example, you can configure custom MCPs in this way:
+
+      plan =
+        CIA.new()
+        |> CIA.harness(:codex, auth: {:api_key, key})
+        |> CIA.mcp(:docs,
+          transport: :http,
+          url: "https://mcp.example.com",
+          headers: %{"Authorization" => "Bearer ..."}
+        )
+
+  And configure custom tool policies:
+
+      CIA.tool(plan, allow: [{:mcp, :docs, :all}], approval: :never)
+
+  ## Extending CIA
+
+  CIA is designed to normalize the core runtime model while still allowing
+  application-specific providers and harness adapters via:
+
+    * custom sandbox providers implementing `CIA.Sandbox`
+    * custom harness adapters implementing `CIA.Harness`
+    * custom workspace adapters implementing `CIA.Workspace`
   """
 
   alias CIA.{Agent, Plan, Sandbox, Thread, Workspace}
@@ -94,21 +199,34 @@ defmodule CIA do
   @hook_names [:before_start, :after_start, :before_stop, :after_stop]
 
   @doc """
-  Creates a new pipeable CIA configuration.
+  Creates a new CIA agent configuration.
 
-  Configurations are pure builders. They do not provision a sandbox,
-  create a workspace, or start an agent on their own.
+  Agents are data-only "plans" until started with `CIA.start/2`.
   """
   def new do
     Plan.new()
   end
 
   @doc """
-  Adds sandbox configuration to a pipeable CIA configuration.
+  Configures the given plan to use a sandbox with the given `provider`.
 
-  The first argument selects the sandbox provider. All remaining
-  sandbox configuration belongs here, including provider-specific
-  options and identifiers.
+  Provider must be one of the supported "shortcut" atoms:
+
+    * `:local` - to simply use the local machine
+    * `:sprite` - to use a [Sprite](https://sprites.dev)
+
+  Or a module which implements the `CIA.Sandbox` behaviour.
+
+  ## Options
+
+    * `:name` - the name of the sandbox, typically handled by the provider.
+
+    * `:lifecycle` - the lifecycle of the sandbox that the running agent
+      is attached to. One of `:ephemeral`, `:durable`, or `:attached`.
+      See [Sandbox Lifecycles](#) for more information.
+
+  All other options are forwared to the provider, and should be assumed to
+  be provider-specific.
   """
   def sandbox(%Plan{} = plan, provider, opts \\ [])
       when is_atom(provider) and is_list(opts) do
@@ -137,15 +255,18 @@ defmodule CIA do
   - `:before_stop`
   - `:after_stop`
 
-  Hook callbacks are unary functions that receive a context map. `before_*`
-  hooks must return `:ok`; any other return value aborts that agent operation.
-  `after_*` hooks are observational and receive the final `:result` for the
-  attempted operation.
+  Hook callbacks are unary functions that receive a context map. Hooks may
+  return either `:ok` or `{:ok, state}` where `state` is a user-defined map
+  persisted for the lifetime of the agent and threaded through later hook
+  contexts. Invalid return values from `before_*` hooks abort that agent
+  operation. `after_*` hooks are observational and receive the final `:result`
+  for the attempted operation.
 
   These hooks are agent-scoped. `before_start/2` and `after_start/2` are
   relative to the CIA agent lifecycle, not sandbox lifecycle. `before_start/2`
   receives the live sandbox runtime because sandbox provisioning happens before
-  the agent is considered started.
+  the agent is considered started. Hook contexts also include the current
+  user-defined `:state` map.
   """
   def hook(%Plan{} = plan, hook_name, fun) when is_atom(hook_name) and is_function(fun, 1) do
     Plan.put_hook(plan, hook_name, fun)
@@ -164,11 +285,35 @@ defmodule CIA do
   The first argument selects the harness implementation. This configuration is
   stored on the returned builder state and does not start a live agent on its
   own. All remaining harness configuration belongs here,
-  including harness, auth, names, and identifiers.
+  including harness, auth, instructions, names, and identifiers.
   """
   def harness(%Plan{} = plan, harness, opts \\ [])
       when is_atom(harness) and is_list(opts) do
     Plan.put_harness(plan, Keyword.put(opts, :harness, harness))
+  end
+
+  @doc """
+  Adds an MCP server declaration to the plan.
+
+  `CIA.mcp/3` is additive and upserts by server id. MCP declarations may appear
+  before or after `CIA.harness/3`. Once a harness is configured, CIA compiles
+  the accumulated MCP declarations into the runtime harness configuration.
+  """
+  def mcp(%Plan{} = plan, id, opts \\ [])
+      when (is_atom(id) or is_binary(id)) and is_list(opts) do
+    Plan.put_mcp(plan, id, opts)
+  end
+
+  @doc """
+  Adds normalized tool policy to the plan.
+
+  Multiple `tool/2` calls accumulate allow/deny rules. Singleton values such as
+  approval policy use the last declared value. Tool policy may be declared
+  before or after `CIA.harness/3`; CIA compiles the accumulated policy into the
+  runtime harness configuration.
+  """
+  def tool(%Plan{} = plan, opts) when is_list(opts) do
+    Plan.put_tool(plan, opts)
   end
 
   @doc """
@@ -186,12 +331,6 @@ defmodule CIA do
          {:ok, pid} <- start_agent(start_opts, Keyword.get(opts, :supervisor)) do
       {:ok, Server.agent(pid)}
     end
-  end
-
-  @deprecated "Use CIA.Sandbox.cmd/4 instead."
-  @doc false
-  def exec(sandbox, command, opts \\ []) when is_list(command) and is_list(opts) do
-    Sandbox.exec(sandbox, command, opts)
   end
 
   defp start_agent(opts, nil), do: Server.start_link(opts)
@@ -237,18 +376,47 @@ defmodule CIA do
 
       {:cia, %CIA.Agent{}, event}
 
-  The current event stream forwards harness-originated events from the running
-  agent process:
+  CIA emits normalized events for requests, threads, turns, and sandbox watch
+  activity, while still forwarding raw harness events for compatibility:
+
+      {:cia, agent, {:request, :approval, payload}}
+      {:cia, agent, {:request, :user_input, payload}}
+      {:cia, agent, {:request, :resolved, payload}}
+      {:cia, agent, {:thread, :started, payload}}
+      {:cia, agent, {:turn, :status, payload}}
+      {:cia, agent, {:sandbox, :watch, watch_id, payload}}
 
       {:cia, agent, {:harness, :codex, payload}}
 
-  Subscriptions are agent-wide. You cannot scope to specific events at this time.
+  To scope delivery, pass `events: [...]` with any of:
+
+  - `:thread`
+  - `:turn`
+  - `:request`
+  - `:sandbox`
+  - `:raw`
 
   Subscribers are monitored and automatically removed when the subscriber
   process exits.
   """
-  def subscribe(%Agent{pid: pid}, subscriber \\ self()) when is_pid(pid) and is_pid(subscriber) do
-    Server.subscribe(pid, subscriber)
+  def subscribe(%Agent{pid: pid}, subscriber \\ self(), opts \\ [])
+      when is_pid(pid) and is_pid(subscriber) and is_list(opts) do
+    Server.subscribe(pid, subscriber, opts)
+  end
+
+  @doc """
+  Resolves a pending normalized harness request.
+
+  Current normalized decisions are:
+
+  - `:approve`
+  - `:approve_for_session`
+  - `:deny`
+  - `:cancel`
+  - `{:input, value}`
+  """
+  def resolve(%Agent{pid: pid}, request_id, decision) when is_pid(pid) do
+    Server.resolve(pid, request_id, decision)
   end
 
   @doc """
@@ -263,9 +431,9 @@ defmodule CIA do
   - `:metadata`
 
   `:metadata` is stored by CIA on the returned `%CIA.Thread{}`. The remaining
-  options are currently forwarded to the active harness. For the current Codex
-  harness, they map to thread creation settings for the underlying app-server
-  request.
+  options are currently forwarded to the active harness. `:system_prompt` is a
+  thread-scoped inline override, distinct from harness-level `:instructions`
+  configured through `CIA.harness/3`.
   """
   def thread(%Agent{pid: pid}, opts) when is_pid(pid) and is_list(opts) do
     Server.start_thread(pid, opts)

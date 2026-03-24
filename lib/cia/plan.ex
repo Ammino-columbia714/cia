@@ -2,10 +2,12 @@ defmodule CIA.Plan do
   @moduledoc false
 
   alias CIA.Harness
+  alias CIA.MCP
+  alias CIA.Tool
 
   @hook_names [:before_start, :after_start, :before_stop, :after_stop]
 
-  defstruct sandbox: nil, workspace: nil, harness: nil, hooks: %{}
+  defstruct sandbox: nil, workspace: nil, harness: nil, mcp: %{}, tools: %Tool{}, hooks: %{}
 
   @doc false
   def new do
@@ -25,14 +27,36 @@ defmodule CIA.Plan do
   @doc false
   def put_harness(%__MODULE__{} = plan, opts) when is_list(opts) do
     config =
-      plan.harness
-      |> harness_opts()
+      harness_opts(plan)
       |> Keyword.merge(opts)
       |> ensure_id("agent")
 
-    case Harness.new(config) do
-      {:ok, %Harness{} = harness} -> %__MODULE__{plan | harness: harness}
-      {:error, reason} -> raise ArgumentError, "invalid harness configuration: #{inspect(reason)}"
+    put_compiled_harness(plan, config)
+  end
+
+  @doc false
+  def put_mcp(%__MODULE__{} = plan, id, opts) when is_list(opts) do
+    case MCP.new(id, opts) do
+      {:ok, %MCP{} = server} ->
+        plan
+        |> Map.update!(:mcp, &Map.put(&1, server.id, server))
+        |> sync_harness()
+
+      {:error, reason} ->
+        raise ArgumentError, "invalid MCP configuration: #{inspect(reason)}"
+    end
+  end
+
+  @doc false
+  def put_tool(%__MODULE__{} = plan, opts) when is_list(opts) do
+    case Tool.new(opts) do
+      {:ok, %Tool{} = tool} ->
+        plan
+        |> Map.update!(:tools, &Tool.merge(&1, tool))
+        |> sync_harness()
+
+      {:error, reason} ->
+        raise ArgumentError, "invalid tool configuration: #{inspect(reason)}"
     end
   end
 
@@ -51,10 +75,35 @@ defmodule CIA.Plan do
   defp merge_config(nil, opts), do: Enum.into(opts, %{})
   defp merge_config(config, opts), do: Map.merge(config, Enum.into(opts, %{}))
 
-  defp harness_opts(nil), do: []
+  defp harness_opts(%__MODULE__{harness: nil, mcp: mcp, tools: tools}) do
+    [mcp: mcp, tools: tools]
+  end
 
-  defp harness_opts(%Harness{id: id, harness: harness, config: config}) do
-    [id: id, harness: harness] ++ Map.to_list(config)
+  defp harness_opts(%__MODULE__{
+         harness: %Harness{id: id, harness: harness, config: config},
+         mcp: mcp,
+         tools: tools
+       }) do
+    [id: id, harness: harness, mcp: mcp, tools: tools] ++ Map.to_list(config)
+  end
+
+  defp sync_harness(%__MODULE__{harness: nil} = plan), do: plan
+
+  defp sync_harness(%__MODULE__{} = plan) do
+    plan
+    |> harness_opts()
+    |> put_compiled_harness(plan)
+  end
+
+  defp put_compiled_harness(config, %__MODULE__{} = plan) when is_list(config) do
+    put_compiled_harness(plan, config)
+  end
+
+  defp put_compiled_harness(%__MODULE__{} = plan, config) when is_list(config) do
+    case Harness.new(config) do
+      {:ok, %Harness{} = harness} -> %__MODULE__{plan | harness: harness}
+      {:error, reason} -> raise ArgumentError, "invalid harness configuration: #{inspect(reason)}"
+    end
   end
 
   defp ensure_id(config, prefix) when is_map(config) do

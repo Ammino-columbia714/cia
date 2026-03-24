@@ -28,13 +28,24 @@ defmodule CIA.HarnessTest do
                id: "agent_1",
                harness: :codex,
                auth: {:api_key, "test-key"},
-               command: {"codex", ["app-server"]}
+               command: {"codex", ["app-server"]},
+               instructions: [
+                 inline: "Be careful.",
+                 files: ["./AGENTS.md"],
+                 project_files: true
+               ]
              )
 
     assert harness.id == "agent_1"
     assert harness.harness == :codex
     assert harness.config[:auth] == {:api_key, "test-key"}
     assert harness.config[:command] == {"codex", ["app-server"]}
+
+    assert Harness.instructions(harness) == [
+             {:text, "Be careful."},
+             {:file, "./AGENTS.md"},
+             :project_files
+           ]
   end
 
   test "new requires a harness implementation" do

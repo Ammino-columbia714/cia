@@ -38,8 +38,9 @@ defmodule CIA.Agent.Server do
   def agent(server), do: GenServer.call(server, :agent)
 
   @doc false
-  def subscribe(server, subscriber \\ self()) when is_pid(subscriber) do
-    GenServer.call(server, {:subscribe, subscriber})
+  def subscribe(server, subscriber \\ self(), opts \\ [])
+      when is_pid(subscriber) and is_list(opts) do
+    GenServer.call(server, {:subscribe, subscriber, opts})
   end
 
   @doc false
@@ -63,6 +64,10 @@ defmodule CIA.Agent.Server do
   def cancel_turn(server, turn_or_id), do: GenServer.call(server, {:cancel_turn, turn_or_id})
 
   @doc false
+  def resolve(server, request_id, decision),
+    do: GenServer.call(server, {:resolve, request_id, decision})
+
+  @doc false
   def stop(server, timeout \\ :infinity), do: GenServer.stop(server, :normal, timeout)
 
   @impl true
@@ -71,21 +76,21 @@ defmodule CIA.Agent.Server do
 
     with {:ok, started_state} <- start_runtime(state),
          {:ok, running_state} <- State.put_agent_status(started_state, :running) do
-      _ =
+      final_state =
         run_after_hooks(
           running_state,
           :after_start,
-          hook_context(running_state, %{result: {:ok, running_state.agent}})
+          %{result: {:ok, running_state.agent}}
         )
 
-      {:ok, %__MODULE__{state: running_state}}
+      {:ok, %__MODULE__{state: final_state}}
     else
       {:error, %State{} = failed_state, reason} = error ->
         _ =
           run_after_hooks(
             failed_state,
             :after_start,
-            hook_context(failed_state, %{result: error})
+            %{result: error}
           )
 
         {:stop, reason}
@@ -101,8 +106,12 @@ defmodule CIA.Agent.Server do
     {:reply, agent, server_state}
   end
 
-  def handle_call({:subscribe, subscriber}, _from, %__MODULE__{} = server_state) do
-    {:reply, :ok, add_subscriber(server_state, subscriber)}
+  def handle_call({:subscribe, subscriber, opts}, _from, %__MODULE__{} = server_state) do
+    with {:ok, events} <- validate_subscription_events(Keyword.get(opts, :events, :all)) do
+      {:reply, :ok, add_subscriber(server_state, subscriber, events)}
+    else
+      {:error, _reason} = error -> {:reply, error, server_state}
+    end
   end
 
   def handle_call({:turn, id}, _from, %__MODULE__{state: %State{} = state} = server_state) do
@@ -139,7 +148,13 @@ defmodule CIA.Agent.Server do
         )
 
       updated_state = State.put_thread(state, thread)
-      {:reply, {:ok, thread}, put_state(server_state, updated_state)}
+
+      updated_server_state =
+        server_state
+        |> put_state(updated_state)
+        |> broadcast_event(:thread, {:thread, :started, %{thread_id: thread.id}})
+
+      {:reply, {:ok, thread}, updated_server_state}
     else
       {:error, _reason} = error -> {:reply, error, server_state}
     end
@@ -170,7 +185,15 @@ defmodule CIA.Agent.Server do
         |> State.put_thread(updated_thread)
         |> State.put_turn(turn)
 
-      {:reply, {:ok, turn}, put_state(server_state, updated_state)}
+      updated_server_state =
+        server_state
+        |> put_state(updated_state)
+        |> broadcast_event(
+          :turn,
+          {:turn, :started, %{thread_id: turn.thread_id, turn_id: turn.id}}
+        )
+
+      {:reply, {:ok, turn}, updated_server_state}
     else
       {:error, _reason} = error -> {:reply, error, server_state}
     end
@@ -200,8 +223,26 @@ defmodule CIA.Agent.Server do
            State.update_turn_status(state, turn.id, :cancelled),
          {:ok, %Thread{} = thread} <- State.get_thread(updated_state, turn.thread_id) do
       final_state = State.put_thread(updated_state, %Thread{thread | status: :active})
-      {:reply, {:ok, updated_turn}, put_state(server_state, final_state)}
+      event_payload = %{thread_id: turn.thread_id, turn_id: updated_turn.id, status: :cancelled}
+
+      updated_server_state =
+        server_state
+        |> put_state(final_state)
+        |> broadcast_event(:turn, {:turn, :status, event_payload})
+
+      {:reply, {:ok, updated_turn}, updated_server_state}
     else
+      {:error, _reason} = error -> {:reply, error, server_state}
+    end
+  end
+
+  def handle_call(
+        {:resolve, request_id, decision},
+        _from,
+        %__MODULE__{state: %State{} = state} = server_state
+      ) do
+    case Harness.resolve(state.harness, request_id, decision) do
+      :ok -> {:reply, :ok, server_state}
       {:error, _reason} = error -> {:reply, error, server_state}
     end
   end
@@ -212,7 +253,22 @@ defmodule CIA.Agent.Server do
   end
 
   def handle_info({:cia_harness, harness, payload}, %__MODULE__{} = server_state) do
-    broadcast(server_state, {:harness, harness, payload})
+    updated_server_state =
+      server_state
+      |> maybe_broadcast_normalized_harness_event(harness, payload)
+      |> broadcast_event(:raw, {:harness, harness, payload})
+
+    {:noreply, updated_server_state}
+  end
+
+  def handle_info({:cia_sandbox_watch, watch_id, payload}, %__MODULE__{} = server_state) do
+    updated_server_state =
+      broadcast_event(server_state, :sandbox, {:sandbox, :watch, watch_id, payload})
+
+    {:noreply, updated_server_state}
+  end
+
+  def handle_info(_message, %__MODULE__{} = server_state) do
     {:noreply, server_state}
   end
 
@@ -221,7 +277,11 @@ defmodule CIA.Agent.Server do
         reason,
         %__MODULE__{state: %State{} = state}
       ) do
-    _ = run_before_hooks(state, :before_stop, hook_context(state, %{reason: reason}))
+    state =
+      case run_before_hooks(state, :before_stop, %{reason: reason}) do
+        {:ok, %State{} = updated_state} -> updated_state
+        {:error, _reason} -> state
+      end
 
     %State{sandbox: sandbox, workspace: workspace, harness: harness} = state
 
@@ -241,7 +301,7 @@ defmodule CIA.Agent.Server do
       run_after_hooks(
         state,
         :after_stop,
-        hook_context(state, %{reason: reason, result: :ok})
+        %{reason: reason, result: :ok}
       )
 
     :ok
@@ -252,7 +312,7 @@ defmodule CIA.Agent.Server do
          {:ok, sandbox} <- Sandbox.start(state.sandbox, command: command, env: state.env) do
       sandbox_state = State.put_sandbox(state, sandbox)
 
-      with :ok <- run_before_hooks(sandbox_state, :before_start, hook_context(sandbox_state)),
+      with {:ok, sandbox_state} <- run_before_hooks(sandbox_state, :before_start, %{}),
            {:ok, workspace} <- Workspace.materialize(state.workspace, sandbox) do
         runtime_state = State.put_workspace(sandbox_state, workspace)
 
@@ -296,10 +356,13 @@ defmodule CIA.Agent.Server do
     state.hooks
     |> Map.get(hook_name, [])
     |> Enum.with_index(1)
-    |> Enum.reduce_while(:ok, fn {hook, index}, :ok ->
-      case invoke_hook(hook, context) do
+    |> Enum.reduce_while({:ok, state}, fn {hook, index}, {:ok, state} ->
+      case invoke_hook(hook, hook_context(state, context)) do
         :ok ->
-          {:cont, :ok}
+          {:cont, {:ok, state}}
+
+        {:ok, hook_state} ->
+          {:cont, {:ok, State.put_hook_state(state, hook_state)}}
 
         {:error, reason} ->
           {:halt, {:error, normalize_before_hook_error(hook_name, index, reason)}}
@@ -311,27 +374,29 @@ defmodule CIA.Agent.Server do
     state.hooks
     |> Map.get(hook_name, [])
     |> Enum.with_index(1)
-    |> Enum.each(fn {hook, _index} ->
-      case invoke_hook(hook, context) do
+    |> Enum.reduce(state, fn {hook, _index}, state ->
+      case invoke_hook(hook, hook_context(state, context)) do
         :ok ->
-          :ok
+          state
+
+        {:ok, hook_state} ->
+          State.put_hook_state(state, hook_state)
 
         {:error, _reason} ->
-          :ok
+          state
       end
     end)
-
-    :ok
   end
 
-  defp hook_context(%State{} = state, extra \\ %{}) when is_map(extra) do
+  defp hook_context(%State{} = state, extra) when is_map(extra) do
     Map.merge(
       %{
         agent: state.agent,
         harness: state.harness,
         sandbox: state.sandbox,
         workspace: state.workspace,
-        env: state.env
+        env: state.env,
+        state: state.state
       },
       extra
     )
@@ -341,6 +406,7 @@ defmodule CIA.Agent.Server do
     try do
       case hook.(context) do
         :ok -> :ok
+        {:ok, hook_state} when is_map(hook_state) -> {:ok, hook_state}
         other -> {:error, {:invalid_return, other}}
       end
     rescue
@@ -398,74 +464,35 @@ defmodule CIA.Agent.Server do
     end
   end
 
-  defp sandbox_policy(%State{sandbox: %{mode: :workspace_write}, workspace: %{root: root}})
+  defp sandbox_policy(%State{sandbox: sandbox, workspace: %{root: root}})
        when is_binary(root) do
-    %{
-      "type" => "workspaceWrite",
-      "writableRoots" => [root],
-      "networkAccess" => false,
-      "excludeTmpdirEnvVar" => false,
-      "excludeSlashTmp" => false
-    }
+    case Sandbox.mode(sandbox) do
+      mode when mode in [:workspace_write, "workspace-write", "workspaceWrite"] ->
+        %{
+          "type" => "workspaceWrite",
+          "writableRoots" => [root],
+          "networkAccess" => false,
+          "excludeTmpdirEnvVar" => false,
+          "excludeSlashTmp" => false
+        }
+
+      _ ->
+        sandbox_policy(%State{sandbox: sandbox})
+    end
   end
 
-  defp sandbox_policy(%State{sandbox: %{mode: :read_only}}) do
-    %{
-      "type" => "readOnly",
-      "networkAccess" => false
-    }
-  end
+  defp sandbox_policy(%State{sandbox: sandbox}) do
+    case Sandbox.mode(sandbox) do
+      mode when mode in [:read_only, "read-only", "readOnly"] ->
+        %{"type" => "readOnly", "networkAccess" => false}
 
-  defp sandbox_policy(%State{sandbox: %{mode: :danger_full_access}}) do
-    %{
-      "type" => "dangerFullAccess",
-      "networkAccess" => false
-    }
-  end
+      mode
+      when mode in [:danger_full_access, :full_access, "danger-full-access", "dangerFullAccess"] ->
+        %{"type" => "dangerFullAccess", "networkAccess" => false}
 
-  defp sandbox_policy(%State{sandbox: %{mode: :full_access}}) do
-    %{
-      "type" => "dangerFullAccess",
-      "networkAccess" => false
-    }
-  end
-
-  defp sandbox_policy(%State{sandbox: %{mode: "workspace-write"}, workspace: %{root: root}})
-       when is_binary(root) do
-    %{
-      "type" => "workspaceWrite",
-      "writableRoots" => [root],
-      "networkAccess" => false,
-      "excludeTmpdirEnvVar" => false,
-      "excludeSlashTmp" => false
-    }
-  end
-
-  defp sandbox_policy(%State{sandbox: %{mode: "read-only"}}) do
-    %{"type" => "readOnly", "networkAccess" => false}
-  end
-
-  defp sandbox_policy(%State{sandbox: %{mode: "danger-full-access"}}) do
-    %{"type" => "dangerFullAccess", "networkAccess" => false}
-  end
-
-  defp sandbox_policy(%State{sandbox: %{mode: "dangerFullAccess"}}) do
-    %{"type" => "dangerFullAccess", "networkAccess" => false}
-  end
-
-  defp sandbox_policy(%State{sandbox: %{mode: "readOnly"}}) do
-    %{"type" => "readOnly", "networkAccess" => false}
-  end
-
-  defp sandbox_policy(%State{sandbox: %{mode: "workspaceWrite"}, workspace: %{root: root}})
-       when is_binary(root) do
-    %{
-      "type" => "workspaceWrite",
-      "writableRoots" => [root],
-      "networkAccess" => false,
-      "excludeTmpdirEnvVar" => false,
-      "excludeSlashTmp" => false
-    }
+      _ ->
+        nil
+    end
   end
 
   defp sandbox_policy(_), do: nil
@@ -474,14 +501,20 @@ defmodule CIA.Agent.Server do
     %__MODULE__{server_state | state: state}
   end
 
-  defp add_subscriber(%__MODULE__{subscribers: subscribers} = server_state, pid)
+  defp add_subscriber(%__MODULE__{subscribers: subscribers} = server_state, pid, events)
        when is_pid(pid) do
-    case Map.has_key?(subscribers, pid) do
-      true ->
-        server_state
+    case Map.get(subscribers, pid) do
+      %{ref: ref} ->
+        %__MODULE__{
+          server_state
+          | subscribers: Map.put(subscribers, pid, %{ref: ref, events: events})
+        }
 
-      false ->
-        %__MODULE__{server_state | subscribers: Map.put(subscribers, pid, Process.monitor(pid))}
+      nil ->
+        %__MODULE__{
+          server_state
+          | subscribers: Map.put(subscribers, pid, %{ref: Process.monitor(pid), events: events})
+        }
     end
   end
 
@@ -490,18 +523,295 @@ defmodule CIA.Agent.Server do
       {nil, _subscribers} ->
         server_state
 
-      {ref, subscribers} ->
+      {%{ref: ref}, subscribers} ->
         Process.demonitor(ref, [:flush])
         %__MODULE__{server_state | subscribers: subscribers}
     end
   end
 
-  defp broadcast(
-         %__MODULE__{state: %State{agent: %Agent{} = agent}, subscribers: subscribers},
+  defp broadcast_event(
+         %__MODULE__{state: %State{agent: %Agent{} = agent}, subscribers: subscribers} =
+           server_state,
+         category,
          event
        ) do
-    Enum.each(Map.keys(subscribers), fn subscriber ->
-      send(subscriber, {:cia, agent, event})
+    Enum.each(subscribers, fn {subscriber, %{events: events}} ->
+      if subscribed_to_event?(events, category) do
+        send(subscriber, {:cia, agent, event})
+      end
+    end)
+
+    server_state
+  end
+
+  defp maybe_broadcast_normalized_harness_event(
+         %__MODULE__{} = server_state,
+         harness,
+         {:server_request, request}
+       ) do
+    case normalize_request_event(harness, request) do
+      {:ok, event} -> broadcast_event(server_state, :request, event)
+      :ignore -> server_state
+    end
+  end
+
+  defp maybe_broadcast_normalized_harness_event(
+         %__MODULE__{} = server_state,
+         harness,
+         {:server_message, message}
+       ) do
+    server_state
+    |> maybe_update_from_harness_notification(harness, message)
+    |> then(fn updated_server_state ->
+      case normalize_notification_event(harness, message) do
+        {:ok, category, event} -> broadcast_event(updated_server_state, category, event)
+        :ignore -> updated_server_state
+      end
     end)
   end
+
+  defp maybe_broadcast_normalized_harness_event(%__MODULE__{} = server_state, _harness, _payload),
+    do: server_state
+
+  defp maybe_update_from_harness_notification(
+         %__MODULE__{state: %State{} = state} = server_state,
+         :codex,
+         %{method: "turn/updated", params: %{"turnId" => turn_id} = params}
+       ) do
+    status = normalize_turn_status(Map.get(params, "status"))
+
+    updated_state =
+      case status do
+        nil ->
+          state
+
+        status ->
+          with {:ok, state, _turn} <- State.update_turn_status(state, turn_id, status) do
+            state
+          else
+            _ -> state
+          end
+      end
+
+    put_state(server_state, updated_state)
+  end
+
+  defp maybe_update_from_harness_notification(
+         %__MODULE__{state: %State{} = state} = server_state,
+         :codex,
+         %{method: "turn/completed", params: %{"turnId" => turn_id}}
+       ) do
+    updated_state =
+      case State.update_turn_status(state, turn_id, :completed) do
+        {:ok, updated_state, _turn} -> updated_state
+        _ -> state
+      end
+
+    put_state(server_state, updated_state)
+  end
+
+  defp maybe_update_from_harness_notification(
+         %__MODULE__{state: %State{} = state} = server_state,
+         :codex,
+         %{method: method, params: %{"turnId" => turn_id}}
+       )
+       when method in ["turn/interrupted", "turn/cancelled", "turn/failed"] do
+    status =
+      case method do
+        "turn/interrupted" -> :interrupted
+        "turn/cancelled" -> :cancelled
+        "turn/failed" -> :failed
+      end
+
+    updated_state =
+      case State.update_turn_status(state, turn_id, status) do
+        {:ok, updated_state, _turn} -> updated_state
+        _ -> state
+      end
+
+    put_state(server_state, updated_state)
+  end
+
+  defp maybe_update_from_harness_notification(%__MODULE__{} = server_state, _harness, _message),
+    do: server_state
+
+  defp normalize_request_event(
+         :codex,
+         %{id: request_id, method: "item/commandExecution/requestApproval", params: params}
+       ) do
+    {:ok,
+     {:request, :approval,
+      %{
+        id: request_id,
+        kind: :command,
+        thread_id: Map.get(params, "threadId"),
+        turn_id: Map.get(params, "turnId"),
+        item_id: Map.get(params, "itemId"),
+        reason: Map.get(params, "reason"),
+        command: Map.get(params, "command"),
+        cwd: Map.get(params, "cwd"),
+        available_decisions: normalize_available_decisions(Map.get(params, "availableDecisions"))
+      }}}
+  end
+
+  defp normalize_request_event(
+         :codex,
+         %{id: request_id, method: "item/fileChange/requestApproval", params: params}
+       ) do
+    {:ok,
+     {:request, :approval,
+      %{
+        id: request_id,
+        kind: :file_change,
+        thread_id: Map.get(params, "threadId"),
+        turn_id: Map.get(params, "turnId"),
+        item_id: Map.get(params, "itemId"),
+        reason: Map.get(params, "reason"),
+        grant_root: Map.get(params, "grantRoot"),
+        available_decisions: normalize_available_decisions(Map.get(params, "availableDecisions"))
+      }}}
+  end
+
+  defp normalize_request_event(
+         :codex,
+         %{id: request_id, method: method, params: params}
+       )
+       when method in ["tool/requestUserInput", "item/tool/requestUserInput"] do
+    {:ok,
+     {:request, :user_input,
+      %{
+        id: request_id,
+        thread_id: Map.get(params, "threadId"),
+        turn_id: Map.get(params, "turnId"),
+        item_id: Map.get(params, "itemId"),
+        prompt: Map.get(params, "prompt"),
+        questions: Map.get(params, "questions", [])
+      }}}
+  end
+
+  defp normalize_request_event(_harness, _request), do: :ignore
+
+  defp normalize_notification_event(
+         :codex,
+         %{method: "serverRequest/resolved", params: params}
+       ) do
+    {:ok, :request,
+     {:request, :resolved,
+      %{
+        id: Map.get(params, "requestId"),
+        thread_id: Map.get(params, "threadId")
+      }}}
+  end
+
+  defp normalize_notification_event(
+         :codex,
+         %{method: "thread/started", params: %{"threadId" => thread_id} = params}
+       ) do
+    {:ok, :thread, {:thread, :started, %{thread_id: thread_id, name: Map.get(params, "name")}}}
+  end
+
+  defp normalize_notification_event(
+         :codex,
+         %{
+           method: "thread/status/changed",
+           params: %{"threadId" => thread_id, "status" => status}
+         }
+       ) do
+    {:ok, :thread,
+     {:thread, :status, %{thread_id: thread_id, status: normalize_thread_status(status)}}}
+  end
+
+  defp normalize_notification_event(
+         :codex,
+         %{method: method, params: %{"threadId" => thread_id}}
+       )
+       when method in ["thread/archived", "thread/unarchived", "thread/closed"] do
+    event_name =
+      case method do
+        "thread/archived" -> :archived
+        "thread/unarchived" -> :unarchived
+        "thread/closed" -> :closed
+      end
+
+    {:ok, :thread, {:thread, event_name, %{thread_id: thread_id}}}
+  end
+
+  defp normalize_notification_event(
+         :codex,
+         %{method: "turn/updated", params: %{"turnId" => turn_id} = params}
+       ) do
+    {:ok, :turn,
+     {:turn, :status,
+      %{
+        thread_id: Map.get(params, "threadId"),
+        turn_id: turn_id,
+        status: normalize_turn_status(Map.get(params, "status"))
+      }}}
+  end
+
+  defp normalize_notification_event(
+         :codex,
+         %{method: method, params: %{"turnId" => turn_id} = params}
+       )
+       when method in [
+              "turn/started",
+              "turn/completed",
+              "turn/interrupted",
+              "turn/cancelled",
+              "turn/failed"
+            ] do
+    event_name =
+      case method do
+        "turn/started" -> :started
+        "turn/completed" -> :completed
+        "turn/interrupted" -> :interrupted
+        "turn/cancelled" -> :cancelled
+        "turn/failed" -> :failed
+      end
+
+    {:ok, :turn, {:turn, event_name, %{thread_id: Map.get(params, "threadId"), turn_id: turn_id}}}
+  end
+
+  defp normalize_notification_event(_harness, _message), do: :ignore
+
+  defp validate_subscription_events(:all), do: {:ok, :all}
+
+  defp validate_subscription_events(events) when is_list(events) do
+    case Enum.all?(events, &(&1 in [:agent, :thread, :turn, :request, :sandbox, :raw])) do
+      true -> {:ok, MapSet.new(events)}
+      false -> {:error, {:invalid_subscription_events, events}}
+    end
+  end
+
+  defp validate_subscription_events(other),
+    do: {:error, {:invalid_subscription_events, other}}
+
+  defp subscribed_to_event?(:all, _category), do: true
+  defp subscribed_to_event?(%MapSet{} = events, category), do: MapSet.member?(events, category)
+
+  defp normalize_available_decisions(nil) do
+    [:approve, :approve_for_session, :deny, :cancel]
+  end
+
+  defp normalize_available_decisions(decisions) when is_list(decisions) do
+    Enum.map(decisions, fn
+      "accept" -> :approve
+      "acceptForSession" -> :approve_for_session
+      "decline" -> :deny
+      "cancel" -> :cancel
+      other -> other
+    end)
+  end
+
+  @expected_status ["running", "completed", "cancelled", "interrupted", "failed"]
+
+  defp normalize_thread_status(status), do: status
+
+  defp normalize_turn_status(status) when is_binary(status) do
+    with status when status in @expected_status <- status do
+      String.to_existing_atom(status)
+    end
+  end
+
+  defp normalize_turn_status(status), do: status
 end

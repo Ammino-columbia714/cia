@@ -20,6 +20,8 @@ defmodule CIATest do
     assert plan.sandbox == nil
     assert plan.workspace == nil
     assert plan.harness == nil
+    assert plan.mcp == %{}
+    assert plan.tools == %CIA.Tool{}
     assert plan.hooks == %{}
   end
 
@@ -59,6 +61,41 @@ defmodule CIATest do
     assert plan.harness.config[:auth] == {:api_key, "test-key"}
     assert plan.harness.config[:command] == command
     assert String.starts_with?(plan.harness.id, "agent_")
+  end
+
+  test "mcp can be declared before the harness and is compiled into the harness config" do
+    plan =
+      CIA.new()
+      |> CIA.mcp(:filesystem,
+        transport: :stdio,
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+      )
+      |> CIA.harness(:codex, auth: {:api_key, "test-key"})
+
+    assert Map.has_key?(plan.mcp, :filesystem)
+    assert Map.has_key?(plan.harness.mcp, :filesystem)
+
+    assert plan.harness.mcp[:filesystem].command == "npx"
+
+    assert plan.harness.mcp[:filesystem].args == [
+             "-y",
+             "@modelcontextprotocol/server-filesystem",
+             "/workspace"
+           ]
+  end
+
+  test "tool rules can be declared before the harness and accumulate on the plan" do
+    plan =
+      CIA.new()
+      |> CIA.tool(allow: :shell)
+      |> CIA.tool(allow: {:mcp, :filesystem, :all}, approval: :on_request)
+      |> CIA.harness(:codex, auth: {:api_key, "test-key"})
+
+    assert plan.tools.allow == [:shell, {:mcp, :filesystem, :all}]
+    assert plan.tools.approval == :on_request
+    assert plan.harness.tools.allow == [:shell, {:mcp, :filesystem, :all}]
+    assert plan.harness.tools.approval == :on_request
   end
 
   test "hook stores lifecycle callbacks on the plan" do
@@ -105,18 +142,22 @@ defmodule CIATest do
       start_agent(trace_file, %{}, fn plan ->
         plan
         |> CIA.before_start(fn %{agent: agent, sandbox: sandbox} ->
-          send(parent, {:before_start, agent.status, sandbox.__struct__})
+          send(parent, {:before_start, agent.status, sandbox.__struct__, sandbox.status})
           :ok
         end)
         |> CIA.after_start(fn %{agent: agent, sandbox: sandbox, result: {:ok, started_agent}} ->
-          send(parent, {:after_start, agent.status, sandbox.__struct__, started_agent.status})
+          send(
+            parent,
+            {:after_start, agent.status, sandbox.__struct__, sandbox.status, started_agent.status}
+          )
+
           :ok
         end)
       end)
 
     assert agent.status == :running
-    assert_receive {:before_start, :starting, CIA.Sandbox.Local}
-    assert_receive {:after_start, :running, CIA.Sandbox.Local, :running}
+    assert_receive {:before_start, :starting, CIA.Sandbox, :running}
+    assert_receive {:after_start, :running, CIA.Sandbox, :running, :running}
   end
 
   test "runs stop hooks around agent shutdown", %{trace_file: trace_file} do
@@ -126,19 +167,175 @@ defmodule CIATest do
       start_agent(trace_file, %{}, fn plan ->
         plan
         |> CIA.before_stop(fn %{agent: agent, sandbox: sandbox, reason: reason} ->
-          send(parent, {:before_stop, agent.status, sandbox.__struct__, reason})
+          send(parent, {:before_stop, agent.status, sandbox.__struct__, sandbox.status, reason})
           :ok
         end)
         |> CIA.after_stop(fn %{agent: agent, sandbox: sandbox, reason: reason, result: result} ->
-          send(parent, {:after_stop, agent.status, sandbox.__struct__, reason, result})
+          send(
+            parent,
+            {:after_stop, agent.status, sandbox.__struct__, sandbox.status, reason, result}
+          )
+
           :ok
         end)
       end)
 
     assert :ok = CIA.stop(agent)
     refute Process.alive?(agent.pid)
-    assert_receive {:before_stop, :running, CIA.Sandbox.Local, :normal}
-    assert_receive {:after_stop, :running, CIA.Sandbox.Local, :normal, :ok}
+    assert_receive {:before_stop, :running, CIA.Sandbox, :running, :normal}
+    assert_receive {:after_stop, :running, CIA.Sandbox, :running, :normal, :ok}
+  end
+
+  test "threads user-defined hook state across lifecycle hooks", %{trace_file: trace_file} do
+    parent = self()
+
+    {:ok, agent} =
+      start_agent(trace_file, %{}, fn plan ->
+        plan
+        |> CIA.before_start(fn %{state: state} ->
+          send(parent, {:before_start_state, state})
+          {:ok, Map.put(state, :started, true)}
+        end)
+        |> CIA.after_start(fn %{state: state} ->
+          send(parent, {:after_start_state, state})
+          {:ok, Map.put(state, :after_started, true)}
+        end)
+        |> CIA.before_stop(fn %{state: state} ->
+          send(parent, {:before_stop_state, state})
+          :ok
+        end)
+        |> CIA.after_stop(fn %{state: state} ->
+          send(parent, {:after_stop_state, state})
+          :ok
+        end)
+      end)
+
+    assert agent.status == :running
+    assert_receive {:before_start_state, %{}}
+    assert_receive {:after_start_state, %{started: true}}
+
+    assert :ok = CIA.stop(agent)
+    assert_receive {:before_stop_state, %{started: true, after_started: true}}
+    assert_receive {:after_stop_state, %{started: true, after_started: true}}
+  end
+
+  test "rebroadcasts sandbox watch events to agent subscribers", %{trace_file: trace_file} do
+    {:ok, agent} = start_agent(trace_file)
+    assert :ok = CIA.subscribe(agent)
+
+    send(
+      agent.pid,
+      {:cia_sandbox_watch, "watch_1", {:event, %{type: :write, path: "/sandbox/demo.txt"}}}
+    )
+
+    assert_receive {:cia, ^agent,
+                    {:sandbox, :watch, "watch_1",
+                     {:event, %{type: :write, path: "/sandbox/demo.txt"}}}}
+  end
+
+  test "broadcasts normalized request events and preserves raw harness events", %{
+    trace_file: trace_file
+  } do
+    scenario = %{
+      events: %{
+        "turn/start" => [
+          %{
+            id: 91,
+            method: "item/commandExecution/requestApproval",
+            params: %{
+              "itemId" => "item_1",
+              "threadId" => "thread_test",
+              "turnId" => "turn_test",
+              "command" => ["git", "push"],
+              "cwd" => "/sandbox",
+              "availableDecisions" => ["accept", "acceptForSession", "decline", "cancel"]
+            }
+          }
+        ]
+      }
+    }
+
+    {:ok, agent} = start_agent(trace_file, scenario)
+    assert :ok = CIA.subscribe(agent)
+    {:ok, thread} = CIA.thread(agent, cwd: "/sandbox")
+
+    {:ok, _turn} = CIA.turn(agent, thread, "Ship it")
+
+    assert_receive {:cia, ^agent,
+                    {:request, :approval,
+                     %{
+                       id: 91,
+                       kind: :command,
+                       command: ["git", "push"],
+                       cwd: "/sandbox",
+                       available_decisions: [:approve, :approve_for_session, :deny, :cancel]
+                     }}}
+
+    assert_receive {:cia, ^agent,
+                    {:harness, :codex,
+                     {:server_request, %{id: 91, method: "item/commandExecution/requestApproval"}}}}
+  end
+
+  test "subscribe can filter to normalized request events only", %{trace_file: trace_file} do
+    scenario = %{
+      events: %{
+        "turn/start" => [
+          %{
+            id: 77,
+            method: "item/fileChange/requestApproval",
+            params: %{
+              "itemId" => "item_2",
+              "threadId" => "thread_test",
+              "turnId" => "turn_test",
+              "grantRoot" => "/sandbox"
+            }
+          }
+        ]
+      }
+    }
+
+    {:ok, agent} = start_agent(trace_file, scenario)
+    assert :ok = CIA.subscribe(agent, self(), events: [:request])
+    {:ok, thread} = CIA.thread(agent, cwd: "/sandbox")
+
+    {:ok, _turn} = CIA.turn(agent, thread, "Edit it")
+
+    assert_receive {:cia, ^agent,
+                    {:request, :approval, %{id: 77, kind: :file_change, grant_root: "/sandbox"}}}
+
+    refute_receive {:cia, ^agent, {:turn, :started, _}}
+    refute_receive {:cia, ^agent, {:harness, :codex, _}}
+  end
+
+  test "resolve sends normalized decisions back to the harness transport", %{
+    trace_file: trace_file
+  } do
+    scenario = %{
+      events: %{
+        "turn/start" => [
+          %{
+            id: 51,
+            method: "item/commandExecution/requestApproval",
+            params: %{
+              "itemId" => "item_1",
+              "threadId" => "thread_test",
+              "turnId" => "turn_test"
+            }
+          }
+        ]
+      }
+    }
+
+    {:ok, agent} = start_agent(trace_file, scenario)
+    assert :ok = CIA.subscribe(agent, self(), events: [:request])
+    {:ok, thread} = CIA.thread(agent, cwd: "/sandbox")
+
+    {:ok, _turn} = CIA.turn(agent, thread, "Deploy it")
+
+    assert_receive {:cia, ^agent, {:request, :approval, %{id: 51}}}
+    assert :ok = CIA.resolve(agent, 51, :approve_for_session)
+
+    assert response_payload(trace_file, 51)["result"] == "acceptForSession"
   end
 
   test "creates a thread and forwards thread options", %{trace_file: trace_file} do
@@ -160,6 +357,42 @@ defmodule CIATest do
              "baseInstructions" => "Be exact",
              "cwd" => "/sandbox",
              "model" => "gpt-5.4"
+           }
+  end
+
+  test "creates a thread with harness instructions layered before the thread prompt", %{
+    trace_file: trace_file
+  } do
+    instruction_file =
+      Path.join(System.tmp_dir!(), "cia-instructions-#{System.unique_integer([:positive])}.md")
+
+    File.write!(instruction_file, "Read the project docs first.")
+
+    on_exit(fn ->
+      File.rm(instruction_file)
+    end)
+
+    {:ok, agent} =
+      start_agent(trace_file, %{}, fn plan ->
+        CIA.harness(plan, :codex,
+          instructions: [
+            {:text, "You are a careful staff engineer."},
+            {:file, instruction_file},
+            :project_files
+          ]
+        )
+      end)
+
+    {:ok, _thread} =
+      CIA.thread(agent,
+        cwd: "/sandbox",
+        system_prompt: "For this thread, prioritize regression risk."
+      )
+
+    assert request_payload(trace_file, "thread/start")["params"] == %{
+             "baseInstructions" =>
+               "You are a careful staff engineer.\n\nRead the project docs first.\n\nFor this thread, prioritize regression risk.",
+             "cwd" => "/sandbox"
            }
   end
 
@@ -260,20 +493,40 @@ defmodule CIATest do
   end
 
   defp request_payload(trace_file, method) do
-    trace_file
-    |> FakeCodexServer.read_trace!()
-    |> Enum.find(fn entry ->
+    wait_for_trace_entry(trace_file, fn entry ->
       entry["direction"] == "received" and get_in(entry, ["payload", "method"]) == method
     end)
     |> then(fn entry -> entry["payload"] end)
   end
 
   defp notification_payload(trace_file, method) do
-    trace_file
-    |> FakeCodexServer.read_trace!()
-    |> Enum.find(fn entry ->
+    wait_for_trace_entry(trace_file, fn entry ->
       entry["direction"] == "sent" and get_in(entry, ["payload", "method"]) == method
     end)
     |> then(fn entry -> entry["payload"] end)
   end
+
+  defp response_payload(trace_file, id) do
+    wait_for_trace_entry(trace_file, fn entry ->
+      get_in(entry, ["payload", "id"]) == id and
+        get_in(entry, ["payload", "result"]) != nil and
+        entry["direction"] in ["response", "received"]
+    end)
+    |> then(fn entry -> entry["payload"] end)
+  end
+
+  defp wait_for_trace_entry(trace_file, matcher, attempts \\ 20)
+
+  defp wait_for_trace_entry(trace_file, matcher, attempts) when attempts > 0 do
+    case trace_file |> FakeCodexServer.read_trace!() |> Enum.find(matcher) do
+      nil ->
+        Process.sleep(10)
+        wait_for_trace_entry(trace_file, matcher, attempts - 1)
+
+      entry ->
+        entry
+    end
+  end
+
+  defp wait_for_trace_entry(_trace_file, _matcher, 0), do: nil
 end
