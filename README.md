@@ -1,5 +1,8 @@
 # CIA - Central Intelligence Agent
 
+[![Hex pm](https://img.shields.io/hexpm/v/cia.svg)](https://hex.pm/packages/cia)
+[![Hexdocs](https://img.shields.io/badge/hexdocs-latest-blue.svg)](https://hexdocs.pm/cia)
+
 Manage background agents directly in your Elixir app.
 
 ## Overview
