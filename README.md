@@ -127,7 +127,7 @@ CIA currently supports Codex through its app-server implementation.
 
 ## Supported Sandboxes
 
-CIA currently supports `:local` and `:sprite` (see [Sprite](https://sprite.dev)) based sandboxes.
+CIA currently supports `:local` and `:sprite` (see [Sprite](https://sprites.dev)) based sandboxes.
 
 ## License
 
